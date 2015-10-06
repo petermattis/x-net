@@ -35,7 +35,7 @@ const (
 	FrameContinuation FrameType = 0x9
 )
 
-var frameName = map[FrameType]string{
+var frameName = [...]string{
 	FrameData:         "DATA",
 	FrameHeaders:      "HEADERS",
 	FramePriority:     "PRIORITY",
@@ -49,8 +49,8 @@ var frameName = map[FrameType]string{
 }
 
 func (t FrameType) String() string {
-	if s, ok := frameName[t]; ok {
-		return s
+	if t >= 0 && int(t) < len(frameName) {
+		return frameName[int(t)]
 	}
 	return fmt.Sprintf("UNKNOWN_FRAME_TYPE_%d", uint8(t))
 }
@@ -120,7 +120,7 @@ var flagName = map[FrameType]map[Flags]string{
 // might be 0).
 type frameParser func(fh FrameHeader, payload []byte) (Frame, error)
 
-var frameParsers = map[FrameType]frameParser{
+var frameParsers = [...]frameParser{
 	FramePriority:     parsePriorityFrame,
 	FrameRSTStream:    parseRSTStreamFrame,
 	FrameSettings:     parseSettingsFrame,
@@ -131,8 +131,10 @@ var frameParsers = map[FrameType]frameParser{
 }
 
 func typeFrameParser(t FrameType) frameParser {
-	if f := frameParsers[t]; f != nil {
-		return f
+	if t >= 0 && int(t) < len(frameParsers) {
+		if f := frameParsers[int(t)]; f != nil {
+			return f
+		}
 	}
 	return parseUnknownFrame
 }
