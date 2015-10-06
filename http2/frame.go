@@ -121,15 +121,12 @@ var flagName = map[FrameType]map[Flags]string{
 type frameParser func(fh FrameHeader, payload []byte) (Frame, error)
 
 var frameParsers = map[FrameType]frameParser{
-	FrameData:         parseDataFrame,
-	FrameHeaders:      parseHeadersFrame,
 	FramePriority:     parsePriorityFrame,
 	FrameRSTStream:    parseRSTStreamFrame,
 	FrameSettings:     parseSettingsFrame,
 	FramePushPromise:  parsePushPromise,
 	FramePing:         parsePingFrame,
 	FrameGoAway:       parseGoAwayFrame,
-	FrameWindowUpdate: parseWindowUpdateFrame,
 	FrameContinuation: parseContinuationFrame,
 }
 
@@ -284,6 +281,10 @@ type Framer struct {
 	// we're in the middle of a header block and a
 	// non-Continuation or Continuation on a different stream is
 	// attempted to be written.
+
+	dataFrameBuf         []DataFrame
+	headersFrameBuf      []HeadersFrame
+	windowUpdateFrameBuf []WindowUpdateFrame
 }
 
 func (f *Framer) startWrite(ftype FrameType, flags Flags, streamID uint32) {
@@ -377,14 +378,56 @@ func (fr *Framer) ReadFrame() (Frame, error) {
 	if fh.Length > fr.maxReadSize {
 		return nil, ErrFrameTooLarge
 	}
-	payload := fr.getReadBuf(fh.Length)
+
+	var payload []byte
+	switch fh.Type {
+	case FrameData:
+		payload = make([]byte, fh.Length)
+	default:
+		payload = fr.getReadBuf(fh.Length)
+	}
 	if _, err := io.ReadFull(fr.r, payload); err != nil {
 		return nil, err
 	}
-	f, err := typeFrameParser(fh.Type)(fh, payload)
-	if err != nil {
-		return nil, err
+
+	var f Frame
+	switch fh.Type {
+	case FrameData, FrameHeaders, FrameWindowUpdate:
+		switch fh.Type {
+		case FrameData:
+			if len(fr.dataFrameBuf) == 0 {
+				fr.dataFrameBuf = make([]DataFrame, 64)
+			}
+			f = &fr.dataFrameBuf[0]
+			fr.dataFrameBuf = fr.dataFrameBuf[1:]
+		case FrameHeaders:
+			if len(fr.headersFrameBuf) == 0 {
+				fr.headersFrameBuf = make([]HeadersFrame, 64)
+			}
+			f = &fr.headersFrameBuf[0]
+			fr.headersFrameBuf = fr.headersFrameBuf[1:]
+		case FrameWindowUpdate:
+			if len(fr.windowUpdateFrameBuf) == 0 {
+				fr.windowUpdateFrameBuf = make([]WindowUpdateFrame, 64)
+			}
+			f = &fr.windowUpdateFrameBuf[0]
+			fr.windowUpdateFrameBuf = fr.windowUpdateFrameBuf[1:]
+		}
+
+		type parser interface {
+			parse(fh FrameHeader, payload []byte) error
+		}
+		if err := f.(parser).parse(fh, payload); err != nil {
+			return nil, err
+		}
+
+	default:
+		f, err = typeFrameParser(fh.Type)(fh, payload)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	fr.lastFrame = f
 	return f, nil
 }
@@ -410,24 +453,22 @@ func (f *DataFrame) Data() []byte {
 	return f.data
 }
 
-func parseDataFrame(fh FrameHeader, payload []byte) (Frame, error) {
+func (f *DataFrame) parse(fh FrameHeader, payload []byte) error {
 	if fh.StreamID == 0 {
 		// DATA frames MUST be associated with a stream. If a
 		// DATA frame is received whose stream identifier
 		// field is 0x0, the recipient MUST respond with a
 		// connection error (Section 5.4.1) of type
 		// PROTOCOL_ERROR.
-		return nil, ConnectionError(ErrCodeProtocol)
+		return ConnectionError(ErrCodeProtocol)
 	}
-	f := &DataFrame{
-		FrameHeader: fh,
-	}
+	f.FrameHeader = fh
 	var padSize byte
 	if fh.Flags.Has(FlagDataPadded) {
 		var err error
 		payload, padSize, err = readByte(payload)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if int(padSize) > len(payload) {
@@ -435,10 +476,10 @@ func parseDataFrame(fh FrameHeader, payload []byte) (Frame, error) {
 		// length of the frame payload, the recipient MUST
 		// treat this as a connection error.
 		// Filed: https://github.com/http2/http2-spec/issues/610
-		return nil, ConnectionError(ErrCodeProtocol)
+		return ConnectionError(ErrCodeProtocol)
 	}
 	f.data = payload[:len(payload)-int(padSize)]
-	return f, nil
+	return nil
 }
 
 var errStreamID = errors.New("invalid streamid")
@@ -463,6 +504,27 @@ func (f *Framer) WriteData(streamID uint32, endStream bool, data []byte) error {
 	f.startWrite(FrameData, flags, streamID)
 	f.wbuf = append(f.wbuf, data...)
 	return f.endWrite()
+}
+
+func (f *Framer) WriteDataHeader(streamID uint32, endStream bool, data []byte, header int) error {
+	if header != frameHeaderLen {
+		panic(fmt.Sprintf("incorrect header size: %d vs %d", header, frameHeaderLen))
+	}
+	// TODO: ignoring padding for now. will add when somebody cares.
+	if !validStreamID(streamID) && !f.AllowIllegalWrites {
+		return errStreamID
+	}
+	var flags Flags
+	if endStream {
+		flags |= FlagDataEndStream
+	}
+	savedWbuf := f.wbuf
+	f.wbuf = data[0:0]
+	f.startWrite(FrameData, flags, streamID)
+	f.wbuf = data
+	err := f.endWrite()
+	f.wbuf = savedWbuf
+	return err
 }
 
 // A SettingsFrame conveys configuration parameters that affect how
@@ -666,9 +728,9 @@ type WindowUpdateFrame struct {
 	Increment uint32
 }
 
-func parseWindowUpdateFrame(fh FrameHeader, p []byte) (Frame, error) {
+func (f *WindowUpdateFrame) parse(fh FrameHeader, p []byte) error {
 	if len(p) != 4 {
-		return nil, ConnectionError(ErrCodeFrameSize)
+		return ConnectionError(ErrCodeFrameSize)
 	}
 	inc := binary.BigEndian.Uint32(p[:4]) & 0x7fffffff // mask off high reserved bit
 	if inc == 0 {
@@ -679,14 +741,13 @@ func parseWindowUpdateFrame(fh FrameHeader, p []byte) (Frame, error) {
 		// control window MUST be treated as a connection
 		// error (Section 5.4.1).
 		if fh.StreamID == 0 {
-			return nil, ConnectionError(ErrCodeProtocol)
+			return ConnectionError(ErrCodeProtocol)
 		}
-		return nil, StreamError{fh.StreamID, ErrCodeProtocol}
+		return StreamError{fh.StreamID, ErrCodeProtocol}
 	}
-	return &WindowUpdateFrame{
-		FrameHeader: fh,
-		Increment:   inc,
-	}, nil
+	f.FrameHeader = fh
+	f.Increment = inc
+	return nil
 }
 
 // WriteWindowUpdate writes a WINDOW_UPDATE frame.
@@ -731,16 +792,14 @@ func (f *HeadersFrame) HasPriority() bool {
 	return f.FrameHeader.Flags.Has(FlagHeadersPriority)
 }
 
-func parseHeadersFrame(fh FrameHeader, p []byte) (_ Frame, err error) {
-	hf := &HeadersFrame{
-		FrameHeader: fh,
-	}
+func (f *HeadersFrame) parse(fh FrameHeader, p []byte) (err error) {
+	f.FrameHeader = fh
 	if fh.StreamID == 0 {
 		// HEADERS frames MUST be associated with a stream.  If a HEADERS frame
 		// is received whose stream identifier field is 0x0, the recipient MUST
 		// respond with a connection error (Section 5.4.1) of type
 		// PROTOCOL_ERROR.
-		return nil, ConnectionError(ErrCodeProtocol)
+		return ConnectionError(ErrCodeProtocol)
 	}
 	var padLength uint8
 	if fh.Flags.Has(FlagHeadersPadded) {
@@ -752,20 +811,20 @@ func parseHeadersFrame(fh FrameHeader, p []byte) (_ Frame, err error) {
 		var v uint32
 		p, v, err = readUint32(p)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		hf.Priority.StreamDep = v & 0x7fffffff
-		hf.Priority.Exclusive = (v != hf.Priority.StreamDep) // high bit was set
-		p, hf.Priority.Weight, err = readByte(p)
+		f.Priority.StreamDep = v & 0x7fffffff
+		f.Priority.Exclusive = (v != f.Priority.StreamDep) // high bit was set
+		p, f.Priority.Weight, err = readByte(p)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if len(p)-int(padLength) <= 0 {
-		return nil, StreamError{fh.StreamID, ErrCodeProtocol}
+		return StreamError{fh.StreamID, ErrCodeProtocol}
 	}
-	hf.headerFragBuf = p[:len(p)-int(padLength)]
-	return hf, nil
+	f.headerFragBuf = p[:len(p)-int(padLength)]
+	return nil
 }
 
 // HeadersFrameParam are the parameters for writing a HEADERS frame.
