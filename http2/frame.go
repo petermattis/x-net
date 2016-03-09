@@ -278,6 +278,7 @@ type Framer struct {
 	// Will probably also need to make frame invalidation have a hook too.
 	getReadBuf func(size uint32) []byte
 	readBuf    []byte // cache for default getReadBuf
+	dataBuf    []byte // cache for data frame payload
 
 	maxWriteSize uint32 // zero means unlimited; TODO: implement
 
@@ -309,6 +310,10 @@ type Framer struct {
 	// (currently 16MB)
 	// If the limit is hit, MetaHeadersFrame.Truncated is set true.
 	MaxHeaderListSize uint32
+
+	// CallerOwnsDataFrameData controls if the caller of ReadFrame is transferred
+	// ownership of DataFrame.data.
+	CallerOwnsDataFrameData bool
 
 	// TODO: track which type of frame & with which flags was sent
 	// last.  Then return an error (unless AllowIllegalWrites) if
@@ -413,6 +418,20 @@ func NewFramer(w io.Writer, r io.Reader) *Framer {
 	return fr
 }
 
+func (fr *Framer) getDataBuf(size uint32) []byte {
+	if cap(fr.dataBuf) < int(size) {
+		n := int(size)
+		// TODO(pmattis): What should the minimum data buf size be?
+		if n < 4*1024 {
+			n = 4 * 1024
+		}
+		fr.dataBuf = make([]byte, n)
+	}
+	b := fr.dataBuf[:size]
+	fr.dataBuf = fr.dataBuf[size:]
+	return b
+}
+
 // SetMaxReadFrameSize sets the maximum size of a frame
 // that will be read by a subsequent call to ReadFrame.
 // It is the caller's responsibility to advertise this
@@ -467,7 +486,12 @@ func (fr *Framer) ReadFrame() (Frame, error) {
 	if fh.Length > fr.maxReadSize {
 		return nil, ErrFrameTooLarge
 	}
-	payload := fr.getReadBuf(fh.Length)
+	var payload []byte
+	if fr.CallerOwnsDataFrameData && fh.Type == FrameData {
+		payload = fr.getDataBuf(fh.Length)
+	} else {
+		payload = fr.getReadBuf(fh.Length)
+	}
 	if _, err := io.ReadFull(fr.r, payload); err != nil {
 		return nil, err
 	}
